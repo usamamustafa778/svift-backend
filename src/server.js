@@ -230,6 +230,49 @@ app.post('/auth/login/verify', async (req, res) => {
   }
 });
 
+// Real Google login – verifies the OAuth access token with Google's userinfo API
+app.post('/auth/login/google', async (req, res) => {
+  try {
+    const { accessToken } = req.body;
+    if (!accessToken) {
+      return res.status(400).json({ message: 'Google access token is required' });
+    }
+
+    // Verify token by fetching the user's profile from Google
+    const googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!googleRes.ok) {
+      return res.status(401).json({ message: 'Invalid or expired Google token' });
+    }
+
+    const googleUser = await googleRes.json();
+    const { sub: googleId, email } = googleUser;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Google account has no email address' });
+    }
+
+    // Find existing user by googleId or email, then link / create
+    let user = await User.findOne({ $or: [{ googleId }, { email }] });
+    if (!user) {
+      user = await User.create({ email, googleId, isVerified: true });
+    } else {
+      let changed = false;
+      if (!user.googleId) { user.googleId = googleId; changed = true; }
+      if (!user.isVerified) { user.isVerified = true; changed = true; }
+      if (changed) await user.save();
+    }
+
+    const token = signToken(user.id);
+    return res.json({ message: 'Google login successful', token, email: user.email });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Step 3: complete signup by setting password after email OTP verification
 app.post('/auth/signup/complete', async (req, res) => {
   try {

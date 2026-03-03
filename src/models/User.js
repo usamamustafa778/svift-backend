@@ -24,6 +24,10 @@ const userSchema = new mongoose.Schema(
     verificationCodeExpiresAt: {
       type: Date,
     },
+    googleId: {
+      type: String,
+      sparse: true,
+    },
   },
   { timestamps: true }
 );
