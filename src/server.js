@@ -182,6 +182,7 @@ app.post('/auth/login', async (req, res) => {
       message: 'Login successful',
       token,
       email: user.email,
+      name: user.name || '',
     });
   } catch (err) {
     console.error(err);
@@ -223,6 +224,7 @@ app.post('/auth/login/verify', async (req, res) => {
       message: 'Login verified',
       token,
       email: user.email,
+      name: user.name || '',
     });
   } catch (err) {
     console.error(err);
@@ -238,35 +240,46 @@ app.post('/auth/login/google', async (req, res) => {
       return res.status(400).json({ message: 'Google access token is required' });
     }
 
-    // Verify token by fetching the user's profile from Google
-    const googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    // Use OpenID Connect userinfo (more reliable for name) – fallback to oauth2/v3
+    let googleUser;
+    let googleRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-
+    if (!googleRes.ok) {
+      googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+    }
     if (!googleRes.ok) {
       return res.status(401).json({ message: 'Invalid or expired Google token' });
     }
 
-    const googleUser = await googleRes.json();
+    googleUser = await googleRes.json();
     const { sub: googleId, email } = googleUser;
 
     if (!email) {
       return res.status(400).json({ message: 'Google account has no email address' });
     }
 
+    // Use Google name: name → given_name + family_name → email prefix
+    const name = (googleUser.name && String(googleUser.name).trim())
+      || [googleUser.given_name, googleUser.family_name].filter(Boolean).join(' ').trim()
+      || email.split('@')[0];
+
     // Find existing user by googleId or email, then link / create
     let user = await User.findOne({ $or: [{ googleId }, { email }] });
     if (!user) {
-      user = await User.create({ email, googleId, isVerified: true });
+      user = await User.create({ email, name, googleId, isVerified: true });
     } else {
       let changed = false;
       if (!user.googleId) { user.googleId = googleId; changed = true; }
       if (!user.isVerified) { user.isVerified = true; changed = true; }
+      if (user.name !== name) { user.name = name; changed = true; }
       if (changed) await user.save();
     }
 
     const token = signToken(user.id);
-    return res.json({ message: 'Google login successful', token, email: user.email });
+    return res.json({ message: 'Google login successful', token, email: user.email, name: user.name || name });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error' });
@@ -305,6 +318,7 @@ app.post('/auth/signup/complete', async (req, res) => {
       message: 'Account created successfully',
       token,
       email: user.email,
+      name: user.name || '',
     });
   } catch (err) {
     console.error(err);
