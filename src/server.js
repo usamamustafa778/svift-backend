@@ -293,7 +293,7 @@ app.post('/auth/login/google', async (req, res) => {
     }
 
     googleUser = await googleRes.json();
-    const { sub: googleId, email } = googleUser;
+    const { sub: googleId, email, picture: googlePicture } = googleUser;
 
     if (!email) {
       return res.status(400).json({ message: 'Google account has no email address' });
@@ -307,12 +307,24 @@ app.post('/auth/login/google', async (req, res) => {
     // Find existing user by googleId or email, then link / create
     let user = await User.findOne({ $or: [{ googleId }, { email }] });
     if (!user) {
-      user = await User.create({ email, name, googleId, isVerified: true });
+      // New user: store Google photo as profilePhotoUrl (first time only)
+      user = await User.create({
+        email,
+        name,
+        googleId,
+        isVerified: true,
+        profilePhotoUrl: googlePicture && String(googlePicture).trim() ? googlePicture : null,
+      });
     } else {
       let changed = false;
       if (!user.googleId) { user.googleId = googleId; changed = true; }
       if (!user.isVerified) { user.isVerified = true; changed = true; }
       if (user.name !== name) { user.name = name; changed = true; }
+      // Use Google photo only if user has no profilePhotoUrl yet (first time; custom upload overwrites this)
+      if (!user.profilePhotoUrl && googlePicture && String(googlePicture).trim()) {
+        user.profilePhotoUrl = googlePicture;
+        changed = true;
+      }
       if (changed) await user.save();
     }
 
