@@ -6,9 +6,30 @@ const morgan = require('morgan');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const { v2: cloudinary } = require('cloudinary');
 
 const User = require('./models/User');
 const { sendOtpEmail } = require('./lib/email');
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Use JPEG, PNG, WebP or GIF.'));
+    }
+  },
+});
 
 const app = express();
 
@@ -59,6 +80,21 @@ async function setUserOtp(user, label) {
 
 function signToken(userId) {
   return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '7d' });
+}
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ message: 'Authentication required' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.sub;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
 }
 
 app.get('/', (req, res) => {
@@ -183,6 +219,7 @@ app.post('/auth/login', async (req, res) => {
       token,
       email: user.email,
       name: user.name || '',
+      profilePhotoUrl: user.profilePhotoUrl || null,
     });
   } catch (err) {
     console.error(err);
@@ -225,6 +262,7 @@ app.post('/auth/login/verify', async (req, res) => {
       token,
       email: user.email,
       name: user.name || '',
+      profilePhotoUrl: user.profilePhotoUrl || null,
     });
   } catch (err) {
     console.error(err);
@@ -279,7 +317,13 @@ app.post('/auth/login/google', async (req, res) => {
     }
 
     const token = signToken(user.id);
-    return res.json({ message: 'Google login successful', token, email: user.email, name: user.name || name });
+    return res.json({
+      message: 'Google login successful',
+      token,
+      email: user.email,
+      name: user.name || name,
+      profilePhotoUrl: user.profilePhotoUrl || null,
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error' });
@@ -319,6 +363,7 @@ app.post('/auth/signup/complete', async (req, res) => {
       token,
       email: user.email,
       name: user.name || '',
+      profilePhotoUrl: user.profilePhotoUrl || null,
     });
   } catch (err) {
     console.error(err);
@@ -349,5 +394,61 @@ app.post('/auth/otp/resend', async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get current user profile (requires auth)
+app.get('/users/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select('email name profilePhotoUrl');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    return res.json({
+      email: user.email,
+      name: user.name || '',
+      profilePhotoUrl: user.profilePhotoUrl || null,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Upload profile photo (requires auth)
+app.patch('/users/me/profile-photo', authMiddleware, upload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No photo file provided' });
+    }
+
+    const user = await User.findById(req.userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          folder: 'svift-profile-photos',
+          transformation: [
+            { width: 400, height: 400, crop: 'fill', gravity: 'face' },
+          ],
+        },
+        (err, result) => (err ? reject(err) : resolve(result))
+      );
+      uploadStream.end(req.file.buffer);
+    });
+
+    user.profilePhotoUrl = result.secure_url;
+    await user.save();
+
+    return res.json({ profilePhotoUrl: user.profilePhotoUrl });
+  } catch (err) {
+    console.error('Profile photo upload error:', err);
+    if (err.message && err.message.includes('Invalid file type')) {
+      return res.status(400).json({ message: err.message });
+    }
+    return res.status(500).json({ message: 'Failed to upload profile photo' });
   }
 });
