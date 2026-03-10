@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const { v2: cloudinary } = require('cloudinary');
+const jwksClient = require('jwks-rsa');
 
 const User = require('./models/User');
 const { sendOtpEmail } = require('./lib/email');
@@ -338,6 +339,85 @@ app.post('/auth/login/google', async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Sign in with Apple – verify identity token and create/find user
+const appleJwksClient = jwksClient({
+  jwksUri: 'https://appleid.apple.com/auth/keys',
+  cache: true,
+  cacheMaxAge: 600000,
+});
+
+async function verifyAppleIdentityToken(identityToken) {
+  const decoded = jwt.decode(identityToken, { complete: true });
+  if (!decoded || !decoded.header || !decoded.header.kid) {
+    throw new Error('Invalid Apple identity token');
+  }
+  const signingKey = await appleJwksClient.getSigningKey(decoded.header.kid);
+  const publicKey = signingKey.getPublicKey();
+  const appleClientId = process.env.APPLE_CLIENT_ID;
+  const verified = jwt.verify(identityToken, publicKey, {
+    algorithms: ['RS256'],
+    issuer: 'https://appleid.apple.com',
+    audience: appleClientId || undefined,
+  });
+  return verified;
+}
+
+app.post('/auth/login/apple', async (req, res) => {
+  try {
+    const { identityToken, fullName, email: clientEmail } = req.body;
+    if (!identityToken || typeof identityToken !== 'string') {
+      return res.status(400).json({ message: 'Apple identity token is required' });
+    }
+
+    const payload = await verifyAppleIdentityToken(identityToken);
+    const appleId = payload.sub;
+
+    // Email: from JWT (Apple may include it) or from client (first sign-in only)
+    let email = payload.email || clientEmail;
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ message: 'Email is required for Apple Sign-In. Please share your email with the app.' });
+    }
+    email = email.trim().toLowerCase();
+
+    // Name: from client fullName (only on first sign-in) or email prefix
+    const givenName = fullName?.givenName || '';
+    const familyName = fullName?.familyName || '';
+    const nameFromApple = [givenName, familyName].filter(Boolean).join(' ').trim();
+    const name = nameFromApple || email.split('@')[0];
+
+    let user = await User.findOne({ $or: [{ appleId }, { email }] });
+    if (!user) {
+      user = await User.create({
+        email,
+        name,
+        appleId,
+        isVerified: true,
+      });
+    } else {
+      let changed = false;
+      if (!user.appleId) { user.appleId = appleId; changed = true; }
+      if (!user.isVerified) { user.isVerified = true; changed = true; }
+      if (user.name !== name && name) { user.name = name; changed = true; }
+      if (changed) await user.save();
+    }
+
+    const token = signToken(user.id);
+    return res.json({
+      message: 'Apple login successful',
+      token,
+      email: user.email,
+      name: user.name || name,
+      profilePhotoUrl: user.profilePhotoUrl || null,
+    });
+  } catch (err) {
+    if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
+      return res.status(401).json({ message: 'Invalid or expired Apple token' });
+    }
+    console.error('Apple login error:', err);
     return res.status(500).json({ message: 'Server error' });
   }
 });
